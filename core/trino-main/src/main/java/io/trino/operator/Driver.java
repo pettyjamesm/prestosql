@@ -91,6 +91,7 @@ public class Driver
     private SplitAssignment currentSplitAssignment;
 
     private final AtomicReference<SettableFuture<Void>> driverBlockedFuture = new AtomicReference<>();
+    private final SettableFuture<Void> destroyedFuture = SettableFuture.create();
 
     private enum State
     {
@@ -158,6 +159,11 @@ public class Driver
         return driverContext;
     }
 
+    public ListenableFuture<Void> getDestroyedFuture()
+    {
+        return destroyedFuture;
+    }
+
     public Optional<PlanNodeId> getSourceId()
     {
         return sourceOperator.map(SourceOperator::getSourceId);
@@ -183,7 +189,7 @@ public class Driver
 
         // if we can get the lock, attempt a clean shutdown; otherwise someone else will shutdown
         Optional<Boolean> result = tryWithLockUninterruptibly(this::isFinishedInternal);
-        return result.orElseGet(() -> state.get() != State.ALIVE || driverContext.isDone());
+        return result.orElseGet(() -> state.get() != State.ALIVE || driverContext.isTerminatingOrDone());
     }
 
     @GuardedBy("exclusiveLock")
@@ -191,7 +197,7 @@ public class Driver
     {
         checkLockHeld("Lock must be held to call isFinishedInternal");
 
-        boolean finished = state.get() != State.ALIVE || driverContext.isDone() || activeOperators.isEmpty() || activeOperators.get(activeOperators.size() - 1).isFinished();
+        boolean finished = state.get() != State.ALIVE || activeOperators.isEmpty() || activeOperators.get(activeOperators.size() - 1).isFinished() || driverContext.isTerminatingOrDone();
         if (finished) {
             state.compareAndSet(State.ALIVE, State.NEED_DESTRUCTION);
         }
@@ -379,7 +385,7 @@ public class Driver
         }
 
         boolean movedPage = false;
-        for (int i = 0; i < activeOperators.size() - 1 && !driverContext.isDone(); i++) {
+        for (int i = 0; i < activeOperators.size() - 1 && !driverContext.isTerminatingOrDone(); i++) {
             Operator current = activeOperators.get(i);
             Operator next = activeOperators.get(i + 1);
 
@@ -471,7 +477,7 @@ public class Driver
     @GuardedBy("exclusiveLock")
     private void handleMemoryRevoke()
     {
-        for (int i = 0; i < activeOperators.size() && !driverContext.isDone(); i++) {
+        for (int i = 0; i < activeOperators.size() && !driverContext.isTerminatingOrDone(); i++) {
             Operator operator = activeOperators.get(i);
 
             if (revokingOperators.containsKey(operator)) {
@@ -525,6 +531,9 @@ public class Driver
                     t,
                     "Error destroying driver for task %s",
                     driverContext.getTaskId());
+        }
+        finally {
+            destroyedFuture.set(null);
         }
 
         if (inFlightException != null) {

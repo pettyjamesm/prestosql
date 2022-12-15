@@ -38,7 +38,7 @@ public class DriverFactory
     private final OptionalInt driverInstances;
 
     @GuardedBy("this")
-    private boolean noMoreDrivers;
+    private volatile boolean noMoreDrivers; // must synchronize between createDriver() and noMoreDrivers(), but isNoMoreDrivers() need not synchronize
 
     public DriverFactory(int pipelineId, boolean inputDriver, boolean outputDriver, List<OperatorFactory> operatorFactories, OptionalInt driverInstances)
     {
@@ -93,16 +93,20 @@ public class DriverFactory
         return operatorFactories;
     }
 
-    public synchronized Driver createDriver(DriverContext driverContext)
+    public Driver createDriver(DriverContext driverContext)
     {
-        checkState(!noMoreDrivers, "noMoreDrivers is already set");
         requireNonNull(driverContext, "driverContext is null");
-        List<Operator> operators = new ArrayList<>();
+        List<Operator> operators = new ArrayList<>(operatorFactories.size());
         try {
-            for (OperatorFactory operatorFactory : operatorFactories) {
-                Operator operator = operatorFactory.createOperator(driverContext);
-                operators.add(operator);
+            synchronized (this) {
+                // must check noMoreDrivers after acquiring the lock
+                checkState(!noMoreDrivers, "noMoreDrivers is already set");
+                for (OperatorFactory operatorFactory : operatorFactories) {
+                    Operator operator = operatorFactory.createOperator(driverContext);
+                    operators.add(operator);
+                }
             }
+            // Driver creation can continue without holding the lock
             return Driver.createDriver(driverContext, operators);
         }
         catch (Throwable failure) {
@@ -141,7 +145,7 @@ public class DriverFactory
         }
     }
 
-    public synchronized boolean isNoMoreDrivers()
+    public boolean isNoMoreDrivers()
     {
         return noMoreDrivers;
     }

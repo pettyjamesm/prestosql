@@ -66,7 +66,9 @@ import static io.airlift.units.DataSize.succinctBytes;
 import static io.trino.execution.DynamicFiltersCollector.INITIAL_DYNAMIC_FILTERS_VERSION;
 import static io.trino.execution.DynamicFiltersCollector.INITIAL_DYNAMIC_FILTER_DOMAINS;
 import static io.trino.execution.TaskState.ABORTED;
+import static io.trino.execution.TaskState.ABORTING;
 import static io.trino.execution.TaskState.FAILED;
+import static io.trino.execution.TaskState.FAILING;
 import static io.trino.execution.TaskState.RUNNING;
 import static io.trino.util.Failures.toFailures;
 import static java.util.Objects.requireNonNull;
@@ -153,54 +155,61 @@ public class SqlTask
         requireNonNull(onDone, "onDone is null");
         requireNonNull(failedTasks, "failedTasks is null");
         taskStateMachine.addStateChangeListener(newState -> {
-            if (!newState.isDone()) {
-                if (newState != RUNNING) {
-                    // notify that task state changed (apart from initial RUNNING state notification)
-                    notifyStatusChanged();
-                }
-                return;
-            }
-
-            // Update failed tasks counter
-            if (newState == FAILED) {
-                failedTasks.update(1);
-            }
-
-            // store final task info
-            while (true) {
-                TaskHolder taskHolder = taskHolderReference.get();
-                if (taskHolder.isFinished()) {
-                    // another concurrent worker already set the final state
-                    return;
-                }
-
-                if (taskHolderReference.compareAndSet(taskHolder, new TaskHolder(
-                        createTaskInfo(taskHolder),
-                        taskHolder.getIoStats(),
-                        taskHolder.getDynamicFilterDomains()))) {
-                    break;
-                }
-            }
-
             // make sure buffers are cleaned up
-            if (newState == FAILED || newState == ABORTED) {
-                // don't close buffers for a failed query
-                // closed buffers signal to upstream tasks that everything finished cleanly
-                outputBuffer.abort();
-            }
-            else {
-                outputBuffer.destroy();
+            if (newState.isTerminatingOrDone()) {
+                // Update failed tasks counter
+                if (newState == FAILED) {
+                    failedTasks.update(1);
+                }
+
+                if (newState == FAILED || newState == FAILING || newState == ABORTED || newState == ABORTING) {
+                    // don't close buffers for a failed query
+                    // closed buffers signal to upstream tasks that everything finished cleanly
+                    outputBuffer.abort();
+                }
+                else {
+                    outputBuffer.destroy();
+                }
+
+                if (newState.isTerminating()) {
+                    // This section must be synchronized to lock out any threads that might be attempting to create a SqlTaskExecution
+                    synchronized (SqlTask.this) {
+                        // No SqlTaskExecution exists, termination is complete
+                        if (taskHolderReference.get().getTaskExecution() == null) {
+                            taskStateMachine.terminationComplete();
+                        }
+                    }
+                }
+                else if (newState.isDone()) {
+                    // store final task info and cleanup when done
+                    while (true) {
+                        TaskHolder taskHolder = taskHolderReference.get();
+                        if (taskHolder.isFinished()) {
+                            // another concurrent worker already set the final state
+                            break;
+                        }
+
+                        if (taskHolderReference.compareAndSet(taskHolder, new TaskHolder(
+                                createTaskInfo(taskHolder),
+                                taskHolder.getIoStats(),
+                                taskHolder.getDynamicFilterDomains()))) {
+                            // Successfully set the final task info, call the completion handler
+                            try {
+                                onDone.accept(this);
+                            }
+                            catch (Exception e) {
+                                log.warn(e, "Error running task cleanup callback %s", SqlTask.this.taskId);
+                            }
+                            break;
+                        }
+                    }
+                }
             }
 
-            try {
-                onDone.accept(this);
+            // notify that task state changed (apart from initial RUNNING state notification)
+            if (newState != RUNNING) {
+                notifyStatusChanged();
             }
-            catch (Exception e) {
-                log.warn(e, "Error running task cleanup callback %s", SqlTask.this.taskId);
-            }
-
-            // notify that task is finished
-            notifyStatusChanged();
         });
     }
 
@@ -443,29 +452,38 @@ public class SqlTask
                 }
                 taskExecution = taskHolder.getTaskExecution();
                 if (taskExecution == null) {
-                    checkState(fragment.isPresent(), "fragment must be present");
-                    taskExecution = sqlTaskExecutionFactory.create(
-                            session,
-                            queryContext,
-                            taskStateMachine,
-                            outputBuffer,
-                            fragment.get(),
-                            this::notifyStatusChanged);
-                    taskHolderReference.compareAndSet(taskHolder, new TaskHolder(taskExecution));
-                    needsPlan.set(false);
-                    taskExecution.start();
+                    TaskState taskState = taskStateMachine.getState();
+                    // Don't create SqlTaskExecution once termination has started
+                    if (!taskState.isTerminatingOrDone()) {
+                        checkState(fragment.isPresent(), "fragment must be present");
+                        taskExecution = sqlTaskExecutionFactory.create(
+                                session,
+                                queryContext,
+                                taskStateMachine,
+                                outputBuffer,
+                                fragment.get(),
+                                this::notifyStatusChanged);
+                        taskHolderReference.compareAndSet(taskHolder, new TaskHolder(taskExecution));
+                        needsPlan.set(false);
+                        taskExecution.start();
+                    }
+                    else if (taskState.isTerminating()) {
+                        // mark termination completed if no SqlTaskExecution was created
+                        taskStateMachine.terminationComplete();
+                    }
                 }
             }
-
-            taskExecution.addSplitAssignments(splitAssignments);
-            taskExecution.getTaskContext().addDynamicFilter(dynamicFilterDomains);
+            if (taskExecution != null) {
+                taskExecution.addSplitAssignments(splitAssignments);
+                taskExecution.getTaskContext().addDynamicFilter(dynamicFilterDomains);
+            }
         }
         catch (Error e) {
             failed(e);
             throw e;
         }
         catch (RuntimeException e) {
-            failed(e);
+            return failed(e);
         }
 
         return getTaskInfo();

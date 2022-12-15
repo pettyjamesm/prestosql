@@ -241,9 +241,9 @@ public class TaskContext
         taskStateMachine.failed(cause);
     }
 
-    public boolean isDone()
+    public boolean isTerminatingOrDone()
     {
-        return taskStateMachine.getState().isDone();
+        return taskStateMachine.getState().isTerminatingOrDone();
     }
 
     public TaskState getState()
