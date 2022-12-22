@@ -264,12 +264,14 @@ public class TestingRemoteTaskFactory
         public void cancel()
         {
             taskStateMachine.cancel();
+            taskStateMachine.terminationComplete();
         }
 
         @Override
         public void abort()
         {
             taskStateMachine.abort();
+            taskStateMachine.terminationComplete();
         }
 
         @Override
@@ -282,6 +284,7 @@ public class TestingRemoteTaskFactory
         public void fail(Throwable cause)
         {
             taskStateMachine.failed(cause);
+            taskStateMachine.terminationComplete();
         }
 
         @Override

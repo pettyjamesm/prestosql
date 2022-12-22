@@ -40,7 +40,6 @@ import io.trino.metadata.InternalNode;
 import io.trino.metadata.Split;
 import io.trino.operator.TaskContext;
 import io.trino.operator.TaskStats;
-import io.trino.spi.SplitWeight;
 import io.trino.spiller.SpillSpaceTracker;
 import io.trino.sql.planner.Partitioning;
 import io.trino.sql.planner.PartitioningScheme;
@@ -58,7 +57,6 @@ import javax.annotation.concurrent.GuardedBy;
 
 import java.net.URI;
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -305,6 +303,9 @@ public class MockRemoteTaskFactory
 
         private synchronized void updateSplitQueueSpace()
         {
+            if (runningDrivers == 0 && taskStateMachine.getState().isTerminating()) {
+                taskStateMachine.terminationComplete();
+            }
             if (unacknowledgedSplits < maxUnacknowledgedSplits && getQueuedPartitionedSplitsInfo().getWeightSum() < 900L) {
                 if (!whenSplitQueueHasSpace.isDone()) {
                     whenSplitQueueHasSpace.set(null);
@@ -355,8 +356,9 @@ public class MockRemoteTaskFactory
 
         public synchronized void startSplits(int maxRunning)
         {
-            runningDrivers = splits.size();
-            runningDrivers = Math.min(runningDrivers, maxRunning);
+            if (!taskStateMachine.getState().isTerminatingOrDone()) {
+                runningDrivers = Math.min(splits.size(), maxRunning);
+            }
             updateSplitQueueSpace();
         }
 
@@ -364,7 +366,10 @@ public class MockRemoteTaskFactory
         public void start()
         {
             taskStateMachine.addStateChangeListener(newValue -> {
-                if (newValue.isDone()) {
+                if (newValue.isTerminating()) {
+                    updateSplitQueueSpace(); // potentially finish termination if runningDrivers is zero
+                }
+                else if (newValue.isDone()) {
                     clearSplits();
                 }
             });
@@ -454,27 +459,35 @@ public class MockRemoteTaskFactory
         }
 
         @Override
-        public PartitionedSplitsInfo getPartitionedSplitsInfo()
+        public synchronized PartitionedSplitsInfo getPartitionedSplitsInfo()
         {
             if (taskStateMachine.getState().isDone()) {
                 return PartitionedSplitsInfo.forZeroSplits();
             }
-            synchronized (this) {
-                int count = 0;
-                long weight = 0;
-                for (PlanNodeId tableScanPlanNodeId : fragment.getPartitionedSources()) {
-                    Collection<Split> partitionedSplits = splits.get(tableScanPlanNodeId);
-                    count += partitionedSplits.size();
-                    weight = addExact(weight, SplitWeight.rawValueSum(partitionedSplits, Split::getSplitWeight));
+            // Queued splits are ignored once a task beings terminating, since they will never be started
+            boolean countQueued = !taskStateMachine.getState().isTerminating();
+            // Let's consider the first drivers encountered to be "running"
+            int remainingRunning = runningDrivers;
+            int splitCount = 0;
+            long splitWeight = 0;
+            for (PlanNodeId tableScanPlanNodeId : fragment.getPartitionedSources()) {
+                for (Split split : splits.get(tableScanPlanNodeId)) {
+                    if (countQueued || remainingRunning > 0) {
+                        if (remainingRunning > 0) {
+                            remainingRunning--;
+                        }
+                        splitCount++;
+                        splitWeight = addExact(splitWeight, split.getSplitWeight().getRawValue());
+                    }
                 }
-                return PartitionedSplitsInfo.forSplitCountAndWeightSum(count, weight);
             }
+            return PartitionedSplitsInfo.forSplitCountAndWeightSum(splitCount, splitWeight);
         }
 
         @Override
         public synchronized PartitionedSplitsInfo getQueuedPartitionedSplitsInfo()
         {
-            if (taskStateMachine.getState().isDone()) {
+            if (taskStateMachine.getState().isTerminatingOrDone()) {
                 return PartitionedSplitsInfo.forZeroSplits();
             }
             // Let's consider the first drivers encountered to be "running"

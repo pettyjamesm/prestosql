@@ -17,6 +17,7 @@ import com.google.common.base.Ticker;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import io.airlift.stats.CounterStat;
 import io.airlift.stats.TestingGcMonitor;
@@ -215,6 +216,9 @@ public class TestSqlTask
         assertNull(taskInfo.getStats().getEndTime());
 
         taskInfo = sqlTask.cancel();
+        // This call can race and report either cancelling or cancelled
+        assertTrue(taskInfo.getTaskStatus().getState().isTerminatingOrDone());
+        taskInfo = Futures.getUnchecked(sqlTask.getTaskInfo(taskInfo.getTaskStatus().getVersion()));
         assertEquals(taskInfo.getTaskStatus().getState(), TaskState.CANCELED);
         assertNotNull(taskInfo.getStats().getEndTime());
 
@@ -289,7 +293,7 @@ public class TestSqlTask
         assertFalse(bufferResult.isDone());
 
         sqlTask.cancel();
-        assertEquals(sqlTask.getTaskInfo().getTaskStatus().getState(), TaskState.CANCELED);
+        assertTrue(sqlTask.getTaskInfo().getTaskStatus().getState().isTerminatingOrDone());
 
         // buffer future will complete, the event is async so wait a bit for event to propagate
         bufferResult.get(1, SECONDS);
@@ -312,6 +316,12 @@ public class TestSqlTask
 
         long taskStatusVersion = sqlTask.getTaskInfo().getTaskStatus().getVersion();
         sqlTask.failed(new Exception("test"));
+        // This call can race and return either FAILED or FAILING
+        TaskInfo taskInfo = sqlTask.getTaskInfo(taskStatusVersion).get();
+        assertTrue(taskInfo.getTaskStatus().getState().isTerminatingOrDone());
+
+        // This call should resolve to FAILED if the prior call did not
+        taskStatusVersion = taskInfo.getTaskStatus().getVersion();
         assertEquals(sqlTask.getTaskInfo(taskStatusVersion).get().getTaskStatus().getState(), TaskState.FAILED);
 
         // buffer will not be closed by fail event.  event is async so wait a bit for event to fire
