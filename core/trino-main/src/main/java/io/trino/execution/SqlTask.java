@@ -277,7 +277,7 @@ public class SqlTask
 
         TaskState state = taskStateMachine.getState();
         List<ExecutionFailureInfo> failures = ImmutableList.of();
-        if (state == FAILED) {
+        if (state == FAILED || state == FAILING) {
             failures = toFailures(taskStateMachine.getFailureCauses());
         }
 
