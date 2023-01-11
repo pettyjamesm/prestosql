@@ -173,6 +173,7 @@ public final class HttpRemoteTask
     private final Executor executor;
     private final ScheduledExecutorService errorScheduledExecutor;
     private final Duration maxErrorDuration;
+    private final Duration taskTerminationTimeout;
 
     private final JsonCodec<TaskInfo> taskInfoCodec;
     private final JsonCodec<TaskUpdateRequest> taskUpdateRequestCodec;
@@ -208,6 +209,7 @@ public final class HttpRemoteTask
             Duration maxErrorDuration,
             Duration taskStatusRefreshMaxWait,
             Duration taskInfoUpdateInterval,
+            Duration taskTerminationTimeout,
             boolean summarizeTaskInfo,
             JsonCodec<TaskStatus> taskStatusCodec,
             JsonCodec<VersionedDynamicFilterDomains> dynamicFilterDomainsCodec,
@@ -246,6 +248,7 @@ public final class HttpRemoteTask
             this.executor = executor;
             this.errorScheduledExecutor = errorScheduledExecutor;
             this.maxErrorDuration = requireNonNull(maxErrorDuration, "maxErrorDuration is null");
+            this.taskTerminationTimeout = requireNonNull(taskTerminationTimeout, "taskTerminationTimeout is null");
             this.summarizeTaskInfo = summarizeTaskInfo;
             this.taskInfoCodec = taskInfoCodec;
             this.taskUpdateRequestCodec = taskUpdateRequestCodec;
@@ -338,14 +341,17 @@ public final class HttpRemoteTask
 
             taskStatusFetcher.addStateChangeListener(newStatus -> {
                 TaskState state = newStatus.getState();
-                if (state.isDone()) {
+                // cleanup when done or partially cleanup when terminating begins
+                if (state.isTerminatingOrDone()) {
                     cleanUpTask();
+                    if (state.isTerminating()) {
+                        // check for termination timeout
+                        checkTaskStatusForTermination(newStatus);
+                    }
                 }
                 else {
                     partitionedSplitCountTracker.setPartitionedSplits(getPartitionedSplitsInfo());
                     updateSplitQueueSpace();
-                    // check for termination timeout
-                    checkTaskStatusForTermination(newStatus);
                 }
             });
 
@@ -640,11 +646,11 @@ public final class HttpRemoteTask
             }
             this.terminationStartedNanos.compareAndSet(0, currentTimeNanos);
         }
-        else if (terminationStartedNanos != 0 && nanosSince(terminationStartedNanos).compareTo(maxErrorDuration) >= 0) {
+        else if (terminationStartedNanos != 0 && nanosSince(terminationStartedNanos).compareTo(taskTerminationTimeout) >= 0) {
             // timeout and force cleanup locally
             List<ExecutionFailureInfo> failures = ImmutableList.<ExecutionFailureInfo>builderWithExpectedSize(newStatus.getFailures().size() + 1)
                     .addAll(newStatus.getFailures())
-                    .add(toFailure(new TrinoException(REMOTE_TASK_ERROR, format("Task %s failed to terminate after %s, last known state: %s", taskId, maxErrorDuration, newStatus.getState()))))
+                    .add(toFailure(new TrinoException(REMOTE_TASK_ERROR, format("Task %s failed to terminate after %s, last known state: %s", taskId, taskTerminationTimeout, newStatus.getState()))))
                     .build();
             taskStatusFetcher.updateTaskStatus(failWith(newStatus, FAILED, failures));
             cleanUpLocally();
@@ -820,14 +826,15 @@ public final class HttpRemoteTask
 
     private void cleanUpTask()
     {
-        checkState(getTaskStatus().getState().isDone(), "attempt to clean up a task that is not done yet");
+        TaskState taskState = getTaskStatus().getState();
+        checkState(taskState.isTerminatingOrDone(), "attempt to clean up a task that is not terminating or done: %s", taskState);
 
         // clear pending splits to free memory
         synchronized (this) {
             pendingSplits.clear();
             pendingSourceSplitCount = 0;
             pendingSourceSplitsWeight = 0;
-            partitionedSplitCountTracker.setPartitionedSplits(PartitionedSplitsInfo.forZeroSplits());
+            partitionedSplitCountTracker.setPartitionedSplits(getPartitionedSplitsInfo());
             splitQueueHasSpace = true;
             whenSplitQueueHasSpace.complete(null, executor);
         }
@@ -835,17 +842,19 @@ public final class HttpRemoteTask
         // clear pending outbound dynamic filters to free memory
         outboundDynamicFiltersCollector.acknowledge(Long.MAX_VALUE);
 
-        // cancel pending request
-        Future<?> request = currentRequest.getAndSet(null);
-        if (request != null) {
-            request.cancel(true);
+        // only when termination is complete do we shut down status fetching
+        if (taskState.isDone()) {
+            // cancel pending request
+            Future<?> request = currentRequest.getAndSet(null);
+            if (request != null) {
+                request.cancel(true);
+            }
+
+            taskStatusFetcher.stop();
+            // The remote task is likely to get a delete from the PageBufferClient first.
+            // We send an additional delete anyway to get the final TaskInfo
+            scheduleAsyncCleanupRequest(new Backoff(maxErrorDuration), "cleanup", true);
         }
-
-        taskStatusFetcher.stop();
-
-        // The remote task is likely to get a delete from the PageBufferClient first.
-        // We send an additional delete anyway to get the final TaskInfo
-        scheduleAsyncCleanupRequest(new Backoff(maxErrorDuration), "cleanup", true);
     }
 
     @Override
@@ -1109,7 +1118,7 @@ public final class HttpRemoteTask
 
         private void updateStats()
         {
-            Duration requestRoundTrip = Duration.nanosSince(currentRequestStartNanos);
+            Duration requestRoundTrip = nanosSince(currentRequestStartNanos);
             stats.updateRoundTripMillis(requestRoundTrip.toMillis());
         }
     }
