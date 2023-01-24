@@ -21,6 +21,7 @@ import io.airlift.http.client.HttpClient;
 import io.airlift.http.client.HttpUriBuilder;
 import io.airlift.http.client.Request;
 import io.airlift.json.JsonCodec;
+import io.airlift.log.Logger;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 import io.trino.execution.StateMachine;
@@ -30,6 +31,7 @@ import io.trino.execution.TaskInfo;
 import io.trino.execution.TaskState;
 import io.trino.execution.TaskStatus;
 import io.trino.execution.buffer.SpoolingOutputStats;
+import org.joda.time.DateTime;
 
 import javax.annotation.concurrent.GuardedBy;
 
@@ -50,11 +52,16 @@ import static io.airlift.http.client.FullJsonResponseHandler.createFullJsonRespo
 import static io.airlift.http.client.HttpUriBuilder.uriBuilderFrom;
 import static io.airlift.http.client.Request.Builder.prepareGet;
 import static io.airlift.units.Duration.nanosSince;
+import static io.trino.server.InternalHeaders.TRINO_CURRENT_VERSION;
+import static io.trino.server.InternalHeaders.TRINO_MAX_WAIT;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 public class TaskInfoFetcher
 {
+    // TODO: Remove after debugging
+    private static final Logger log = Logger.get(TaskInfoFetcher.class);
+
     private final TaskId taskId;
     private final Consumer<Throwable> onFail;
     private final ContinuousTaskStatusFetcher taskStatusFetcher;
@@ -64,6 +71,7 @@ public class TaskInfoFetcher
 
     private final long updateIntervalMillis;
     private final AtomicLong lastUpdateNanos = new AtomicLong();
+    private final AtomicBoolean terminating = new AtomicBoolean();
     private final ScheduledExecutorService updateScheduledExecutor;
 
     private final Executor executor;
@@ -187,7 +195,7 @@ public class TaskInfoFetcher
                     return;
                 }
             }
-            if (nanosSince(lastUpdateNanos.get()).toMillis() >= updateIntervalMillis) {
+            if (terminating.get() || nanosSince(lastUpdateNanos.get()).toMillis() >= updateIntervalMillis) {
                 sendNextRequest();
             }
         }, 0, 100, MILLISECONDS);
@@ -195,14 +203,13 @@ public class TaskInfoFetcher
 
     private synchronized void sendNextRequest()
     {
-        TaskStatus taskStatus = getTaskInfo().getTaskStatus();
-
         if (!running) {
             return;
         }
 
+        TaskInfo taskInfo = getTaskInfo();
         // we already have the final task info
-        if (isDone(getTaskInfo())) {
+        if (isDone(taskInfo)) {
             stop();
             return;
         }
@@ -211,6 +218,8 @@ public class TaskInfoFetcher
         if (future != null && !future.isDone()) {
             return;
         }
+
+        TaskStatus taskStatus = taskInfo.getTaskStatus();
 
         // if throttled due to error, asynchronously wait for timeout and try again
         ListenableFuture<Void> errorRateLimit = errorTracker.acquireRequestPermit();
@@ -221,14 +230,25 @@ public class TaskInfoFetcher
 
         HttpUriBuilder httpUriBuilder = uriBuilderFrom(taskStatus.getSelf());
         URI uri = summarizeTaskInfo ? httpUriBuilder.addParameter("summarize").build() : httpUriBuilder.build();
-        Request request = prepareGet()
+        Request.Builder builder = prepareGet()
                 .setUri(uri)
-                .setHeader(CONTENT_TYPE, JSON_UTF_8.toString())
-                .build();
+                .setHeader(CONTENT_TYPE, JSON_UTF_8.toString());
+        if (terminating.get()) {
+            builder.setHeader(TRINO_CURRENT_VERSION, Long.toString(taskStatus.getVersion()));
+            builder.setHeader(TRINO_MAX_WAIT, updateIntervalMillis + "ms");
+        }
+        Request request = builder.build();
 
         errorTracker.startRequest();
         future = httpClient.executeAsync(request, createFullJsonResponseHandler(taskInfoCodec));
         Futures.addCallback(future, new SimpleHttpResponseHandler<>(new TaskInfoResponseCallback(), request.getUri(), stats), executor);
+    }
+
+    void startPollingForFinalInfo()
+    {
+        if (terminating.compareAndSet(false, true)) {
+            sendNextRequest();
+        }
     }
 
     synchronized void updateTaskInfo(TaskInfo newTaskInfo)
@@ -262,10 +282,28 @@ public class TaskInfoFetcher
             return newTaskStatus.getVersion() >= oldTaskStatus.getVersion();
         });
 
-        if (updated && newValue.getTaskStatus().getState().isDone()) {
+        // immediately start a new long-polled request when termination starts
+        if (terminating.get()) {
+            sendNextRequest();
+        }
+
+        TaskState newState = newValue.getTaskStatus().getState();
+        if (updated && newState.isDone()) {
             taskStatusFetcher.updateTaskStatus(newTaskInfo.getTaskStatus());
             finalTaskInfo.compareAndSet(Optional.empty(), Optional.of(newValue));
             stop();
+
+            if (newState == TaskState.ABORTED || newState == TaskState.CANCELED || newState == TaskState.FAILED) {
+                DateTime terminatingSince = newValue.getStats().getTerminatingStartTime();
+                DateTime endTime = newValue.getStats().getEndTime();
+                long terminationMillis = -1;
+                if (terminatingSince != null && endTime != null) {
+                    terminationMillis = endTime.getMillis() - terminatingSince.getMillis();
+                }
+                if (terminatingSince == null || endTime == null || terminationMillis >= 1_000) {
+                    log.warn("Task %s terminated with %s in [%s, %s] - %sms", taskId, newState, terminatingSince, endTime, terminationMillis);
+                }
+            }
         }
     }
 

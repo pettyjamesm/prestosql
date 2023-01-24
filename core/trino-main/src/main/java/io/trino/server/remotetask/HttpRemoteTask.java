@@ -646,14 +646,21 @@ public final class HttpRemoteTask
             }
             this.terminationStartedNanos.compareAndSet(0, currentTimeNanos);
         }
-        else if (terminationStartedNanos != 0 && nanosSince(terminationStartedNanos).compareTo(taskTerminationTimeout) >= 0) {
-            // timeout and force cleanup locally
-            List<ExecutionFailureInfo> failures = ImmutableList.<ExecutionFailureInfo>builderWithExpectedSize(newStatus.getFailures().size() + 1)
-                    .addAll(newStatus.getFailures())
-                    .add(toFailure(new TrinoException(REMOTE_TASK_ERROR, format("Task %s failed to terminate after %s, last known state: %s", taskId, taskTerminationTimeout, newStatus.getState()))))
-                    .build();
-            taskStatusFetcher.updateTaskStatus(failWith(newStatus, FAILED, failures));
-            cleanUpLocally();
+        else if (terminationStartedNanos != 0) {
+            // TODO: Remove after debugging
+            Duration terminatingTime = nanosSince(terminationStartedNanos);
+            if (terminatingTime.toMillis() >= 1_000) {
+                log.warn("Task %s - %s for %s", taskId, newStatus.getState(), terminatingTime);
+            }
+            if (terminatingTime.compareTo(taskTerminationTimeout) >= 0) {
+                // timeout and force cleanup locally
+                List<ExecutionFailureInfo> failures = ImmutableList.<ExecutionFailureInfo>builderWithExpectedSize(newStatus.getFailures().size() + 1)
+                        .addAll(newStatus.getFailures())
+                        .add(toFailure(new TrinoException(REMOTE_TASK_ERROR, format("Task %s failed to terminate after %s, last known state: %s", taskId, taskTerminationTimeout, newStatus.getState()))))
+                        .build();
+                taskStatusFetcher.updateTaskStatus(failWith(newStatus, FAILED, failures));
+                cleanUpLocally();
+            }
         }
     }
 
@@ -841,6 +848,10 @@ public final class HttpRemoteTask
 
         // clear pending outbound dynamic filters to free memory
         outboundDynamicFiltersCollector.acknowledge(Long.MAX_VALUE);
+        // stop continuously fetching task status
+        taskStatusFetcher.stop();
+        // start continuously polling for task info which will continue to update task statuses
+        taskInfoFetcher.startPollingForFinalInfo();
 
         // only when termination is complete do we shut down status fetching
         if (taskState.isDone()) {
@@ -849,8 +860,6 @@ public final class HttpRemoteTask
             if (request != null) {
                 request.cancel(true);
             }
-
-            taskStatusFetcher.stop();
             // The remote task is likely to get a delete from the PageBufferClient first.
             // We send an additional delete anyway to get the final TaskInfo
             scheduleAsyncCleanupRequest(new Backoff(maxErrorDuration), "cleanup", true);
