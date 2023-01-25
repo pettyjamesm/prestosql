@@ -323,7 +323,7 @@ public class TaskResource
         }
 
         TaskState state = taskManager.getTaskStatus(taskId).getState();
-        boolean taskFailed = state == TaskState.ABORTED || state == TaskState.FAILED;
+        boolean taskFailed = (state == TaskState.ABORTED || state == TaskState.ABORTING || state == TaskState.FAILED || state == TaskState.FAILING);
 
         long start = System.nanoTime();
         ListenableFuture<BufferResult> bufferResultFuture = taskManager.getTaskResults(taskId, bufferId, token, maxSize);
