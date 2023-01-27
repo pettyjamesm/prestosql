@@ -445,13 +445,6 @@ public class MockRemoteTaskFactory
         }
 
         @Override
-        public void fail(Throwable cause)
-        {
-            taskStateMachine.failed(cause);
-            clearSplits();
-        }
-
-        @Override
         public void failRemotely(Throwable cause)
         {
             taskStateMachine.failed(cause);

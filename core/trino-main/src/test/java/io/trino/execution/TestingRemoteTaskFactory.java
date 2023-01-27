@@ -281,16 +281,10 @@ public class TestingRemoteTaskFactory
         }
 
         @Override
-        public void fail(Throwable cause)
-        {
-            taskStateMachine.failed(cause);
-            taskStateMachine.terminationComplete();
-        }
-
-        @Override
         public void failRemotely(Throwable cause)
         {
             taskStateMachine.failed(cause);
+            taskStateMachine.terminationComplete();
         }
 
         @Override

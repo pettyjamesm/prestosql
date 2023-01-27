@@ -270,7 +270,7 @@ public class PipelinedStageExecution
     public synchronized void failTask(TaskId taskId, Throwable failureCause)
     {
         RemoteTask task = requireNonNull(tasks.get(taskId.getPartitionId()), () -> "task not found: " + taskId);
-        task.fail(failureCause);
+        task.failRemotely(failureCause);
         fail(failureCause);
     }
 
