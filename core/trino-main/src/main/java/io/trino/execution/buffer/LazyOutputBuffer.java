@@ -43,7 +43,6 @@ import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
 import static io.trino.execution.buffer.BufferResult.emptyResults;
-import static io.trino.execution.buffer.BufferState.FINISHED;
 import static java.util.Objects.requireNonNull;
 
 public class LazyOutputBuffer
@@ -209,7 +208,8 @@ public class LazyOutputBuffer
         if (outputBuffer == null) {
             synchronized (this) {
                 if (delegate == null) {
-                    if (stateMachine.getState() == FINISHED) {
+                    // Respond immediately when the output buffer is already destroyed or aborted or failed
+                    if (stateMachine.getState().isTerminal()) {
                         return immediateFuture(emptyResults(taskInstanceId, 0, true));
                     }
 

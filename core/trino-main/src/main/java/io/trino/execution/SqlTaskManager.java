@@ -508,14 +508,15 @@ public class SqlTaskManager
      * NOTE: this design assumes that only tasks and buffers that will
      * eventually exist are queried.
      */
-    public ListenableFuture<BufferResult> getTaskResults(TaskId taskId, PipelinedOutputBuffers.OutputBufferId bufferId, long startingSequenceId, DataSize maxSize)
+    public SqlTaskWithResults getTaskResults(TaskId taskId, PipelinedOutputBuffers.OutputBufferId bufferId, long startingSequenceId, DataSize maxSize)
     {
         requireNonNull(taskId, "taskId is null");
         requireNonNull(bufferId, "bufferId is null");
         checkArgument(startingSequenceId >= 0, "startingSequenceId is negative");
         requireNonNull(maxSize, "maxSize is null");
 
-        return tasks.getUnchecked(taskId).getTaskResults(bufferId, startingSequenceId, maxSize);
+        SqlTask task = tasks.getUnchecked(taskId);
+        return new SqlTaskWithResults(task, task.getTaskResults(bufferId, startingSequenceId, maxSize));
     }
 
     /**
@@ -776,6 +777,36 @@ public class SqlTaskManager
             for (TaskId stuckSplitTaskId : stuckSplitTaskIds) {
                 failTask(stuckSplitTaskId, new TrinoException(GENERIC_USER_ERROR, format("Task %s is failed, due to containing long running stuck splits.", stuckSplitTaskId)));
             }
+        }
+    }
+
+    public static final class SqlTaskWithResults
+    {
+        private final SqlTask task;
+        private final ListenableFuture<BufferResult> resultsFuture;
+
+        public SqlTaskWithResults(SqlTask task, ListenableFuture<BufferResult> resultsFuture)
+        {
+            this.task = requireNonNull(task, "task is null");
+            this.resultsFuture = requireNonNull(resultsFuture, "resultsFuture is null");
+        }
+
+        public String getTaskInstanceId()
+        {
+            return task.getTaskInstanceId();
+        }
+
+        public boolean isTaskFailedOrFailing()
+        {
+            return switch (task.getTaskState()) {
+                case ABORTED, ABORTING, FAILED, FAILING -> true;
+                default -> false;
+            };
+        }
+
+        public ListenableFuture<BufferResult> getResultsFuture()
+        {
+            return resultsFuture;
         }
     }
 }

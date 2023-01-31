@@ -218,8 +218,13 @@ public class TestSqlTask
         taskInfo = sqlTask.cancel();
         // This call can race and report either cancelling or cancelled
         assertTrue(taskInfo.getTaskStatus().getState().isTerminatingOrDone());
-        taskInfo = Futures.getUnchecked(sqlTask.getTaskInfo(taskInfo.getTaskStatus().getVersion()));
-        assertEquals(taskInfo.getTaskStatus().getState(), TaskState.CANCELED);
+        // Task cancellation can race with output buffer state updates, but should transition to cancelled quickly
+        int attempts = 1;
+        while (!taskInfo.getTaskStatus().getState().isDone() && attempts < 3) {
+            taskInfo = Futures.getUnchecked(sqlTask.getTaskInfo(taskInfo.getTaskStatus().getVersion()));
+            attempts++;
+        }
+        assertEquals(taskInfo.getTaskStatus().getState(), TaskState.CANCELED, "Failed to see CANCELED after " + attempts + " attempts");
         assertNotNull(taskInfo.getStats().getEndTime());
 
         taskInfo = sqlTask.getTaskInfo();

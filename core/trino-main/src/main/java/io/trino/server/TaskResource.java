@@ -29,7 +29,6 @@ import io.trino.execution.FailureInjector.InjectedFailure;
 import io.trino.execution.SqlTaskManager;
 import io.trino.execution.TaskId;
 import io.trino.execution.TaskInfo;
-import io.trino.execution.TaskState;
 import io.trino.execution.TaskStatus;
 import io.trino.execution.buffer.BufferResult;
 import io.trino.execution.buffer.PipelinedOutputBuffers;
@@ -70,6 +69,7 @@ import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static io.airlift.concurrent.MoreFutures.addTimeout;
 import static io.airlift.jaxrs.AsyncResponseHandler.bindAsyncResponse;
 import static io.trino.TrinoMediaTypes.TRINO_PAGES;
+import static io.trino.execution.buffer.BufferResult.emptyResults;
 import static io.trino.server.InternalHeaders.TRINO_BUFFER_COMPLETE;
 import static io.trino.server.InternalHeaders.TRINO_CURRENT_VERSION;
 import static io.trino.server.InternalHeaders.TRINO_MAX_SIZE;
@@ -322,52 +322,26 @@ public class TaskResource
             return;
         }
 
-        TaskState state = taskManager.getTaskStatus(taskId).getState();
-        boolean taskFailed = (state == TaskState.ABORTED || state == TaskState.ABORTING || state == TaskState.FAILED || state == TaskState.FAILING);
-
         long start = System.nanoTime();
-        ListenableFuture<BufferResult> bufferResultFuture = taskManager.getTaskResults(taskId, bufferId, token, maxSize);
+        SqlTaskManager.SqlTaskWithResults taskWithResults = taskManager.getTaskResults(taskId, bufferId, token, maxSize);
+        ListenableFuture<BufferResult> bufferResultFuture = taskWithResults.getResultsFuture();
+        BufferResult emptyBufferResults = emptyResults(taskWithResults.getTaskInstanceId(), token, false);
+
         Duration waitTime = randomizeWaitTime(DEFAULT_MAX_WAIT_TIME);
-        bufferResultFuture = addTimeout(
-                bufferResultFuture,
-                () -> BufferResult.emptyResults(taskManager.getTaskInstanceId(taskId), token, false),
-                waitTime,
-                timeoutExecutor);
+        if (!bufferResultFuture.isDone()) {
+            bufferResultFuture = addTimeout(
+                    taskWithResults.getResultsFuture(),
+                    () -> emptyBufferResults,
+                    waitTime,
+                    timeoutExecutor);
+        }
 
-        ListenableFuture<Response> responseFuture = Futures.transform(bufferResultFuture, result -> {
-            List<Slice> serializedPages = result.getSerializedPages();
-
-            GenericEntity<?> entity = null;
-            Status status;
-            if (serializedPages.isEmpty()) {
-                status = Status.NO_CONTENT;
-            }
-            else {
-                entity = new GenericEntity<>(serializedPages, new TypeToken<List<Slice>>() {}.getType());
-                status = Status.OK;
-            }
-
-            return Response.status(status)
-                    .entity(entity)
-                    .header(TRINO_TASK_INSTANCE_ID, result.getTaskInstanceId())
-                    .header(TRINO_PAGE_TOKEN, result.getToken())
-                    .header(TRINO_PAGE_NEXT_TOKEN, result.getNextToken())
-                    .header(TRINO_BUFFER_COMPLETE, result.isBufferComplete())
-                    .header(TRINO_TASK_FAILED, taskFailed)
-                    .build();
-        }, directExecutor());
+        ListenableFuture<Response> responseFuture = Futures.transform(bufferResultFuture, results -> createResponse(taskWithResults, results), directExecutor());
 
         // For hard timeout, add an additional time to max wait for thread scheduling contention and GC
         Duration timeout = new Duration(waitTime.toMillis() + ADDITIONAL_WAIT_TIME.toMillis(), MILLISECONDS);
         bindAsyncResponse(asyncResponse, responseFuture, responseExecutor)
-                .withTimeout(timeout,
-                        Response.status(Status.NO_CONTENT)
-                                .header(TRINO_TASK_INSTANCE_ID, taskManager.getTaskInstanceId(taskId))
-                                .header(TRINO_PAGE_TOKEN, token)
-                                .header(TRINO_PAGE_NEXT_TOKEN, token)
-                                .header(TRINO_BUFFER_COMPLETE, false)
-                                .header(TRINO_TASK_FAILED, taskFailed)
-                                .build());
+                .withTimeout(timeout, () -> createResponse(taskWithResults, emptyBufferResults));
 
         responseFuture.addListener(() -> readFromOutputBufferTime.add(Duration.nanosSince(start)), directExecutor());
         asyncResponse.register((CompletionCallback) throwable -> resultsRequestTime.add(Duration.nanosSince(start)));
@@ -515,5 +489,29 @@ public class TaskResource
         // Randomize in [T/2, T], so wait is not near zero and the client-supplied max wait time is respected
         long halfWaitMillis = waitTime.toMillis() / 2;
         return new Duration(halfWaitMillis + ThreadLocalRandom.current().nextLong(halfWaitMillis), MILLISECONDS);
+    }
+
+    private static Response createResponse(SqlTaskManager.SqlTaskWithResults taskWithResults, BufferResult result)
+    {
+        List<Slice> serializedPages = result.getSerializedPages();
+
+        GenericEntity<?> entity = null;
+        Status status;
+        if (serializedPages.isEmpty()) {
+            status = Status.NO_CONTENT;
+        }
+        else {
+            entity = new GenericEntity<>(serializedPages, new TypeToken<List<Slice>>() {}.getType());
+            status = Status.OK;
+        }
+
+        return Response.status(status)
+                .entity(entity)
+                .header(TRINO_TASK_INSTANCE_ID, result.getTaskInstanceId())
+                .header(TRINO_PAGE_TOKEN, result.getToken())
+                .header(TRINO_PAGE_NEXT_TOKEN, result.getNextToken())
+                .header(TRINO_BUFFER_COMPLETE, result.isBufferComplete())
+                .header(TRINO_TASK_FAILED, taskWithResults.isTaskFailedOrFailing())
+                .build();
     }
 }
