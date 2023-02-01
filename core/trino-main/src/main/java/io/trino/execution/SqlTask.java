@@ -154,6 +154,16 @@ public class SqlTask
     {
         requireNonNull(onDone, "onDone is null");
         requireNonNull(failedTasks, "failedTasks is null");
+
+        // DEBUGGING
+        outputBuffer.addStateChangeListener(state -> log.info("Task[%s][%s] - OutputBuffer[%s]", taskId, taskInstanceId, state));
+        taskStateMachine.addStateChangeListener(state -> {
+            if (state.isTerminatingOrDone() || state == TaskState.FLUSHING) {
+                log.info("Task[%s][%s] - %s", taskId, taskInstanceId, state);
+            }
+        });
+        log.info("Task[%s][%s] - CREATED", taskId, taskInstanceId);
+
         taskStateMachine.addStateChangeListener(newState -> {
             // make sure buffers are cleaned up
             if (newState.isTerminatingOrDone()) {
