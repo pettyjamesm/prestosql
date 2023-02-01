@@ -43,6 +43,7 @@ import io.trino.sql.planner.plan.PlanNodeId;
 import org.joda.time.DateTime;
 
 import javax.annotation.Nullable;
+import javax.annotation.concurrent.GuardedBy;
 
 import java.net.URI;
 import java.util.List;
@@ -55,6 +56,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 
 import static com.google.common.base.Preconditions.checkArgument;
@@ -93,6 +95,9 @@ public class SqlTask
     private final AtomicLong taskStatusVersion = new AtomicLong(TaskStatus.STARTING_VERSION);
     private final FutureStateChange<?> taskStatusVersionChange = new FutureStateChange<>();
 
+    // Must be acquired when updating the current task holder reference, but not when only reading the current reference value
+    private final ReentrantLock taskHolderLock = new ReentrantLock();
+    @GuardedBy("taskHolderLock")
     private final AtomicReference<TaskHolder> taskHolderReference = new AtomicReference<>(new TaskHolder());
     private final AtomicBoolean needsPlan = new AtomicBoolean(true);
     private final AtomicReference<String> traceToken = new AtomicReference<>();
@@ -144,7 +149,7 @@ public class SqlTask
                 // Pass a memory context supplier instead of a memory context to the output buffer,
                 // because we haven't created the task context that holds the memory context yet.
                 () -> queryContext.getTaskContextByTaskId(taskId).localMemoryContext(),
-                () -> notifyStatusChanged(),
+                this::notifyStatusChanged,
                 exchangeManagerRegistry);
         taskStateMachine = new TaskStateMachine(taskId, taskNotificationExecutor);
     }
@@ -172,6 +177,31 @@ public class SqlTask
                     failedTasks.update(1);
                 }
 
+                boolean isDone = false;
+                // This section must be synchronized to lock out any threads that might be attempting to create a SqlTaskExecution
+                taskHolderLock.lock();
+                try {
+                    TaskHolder taskHolder = taskHolderReference.get();
+                    if (newState.isTerminating()) {
+                        // No SqlTaskExecution exists, termination is complete
+                        if (taskHolder.getTaskExecution() == null) {
+                            taskStateMachine.terminationComplete();
+                        }
+                    }
+                    else if (newState.isDone() && !taskHolder.isFinished()) {
+                        TaskHolder newHolder = new TaskHolder(
+                                createTaskInfo(taskHolder),
+                                taskHolder.getIoStats(),
+                                taskHolder.getDynamicFilterDomains());
+                        // check for a concurrent finishing success / failure
+                        checkState(taskHolderReference.compareAndSet(taskHolder, newHolder), "unsynchronized concurrent task holder update");
+                        isDone = true;
+                    }
+                }
+                finally {
+                    taskHolderLock.unlock();
+                }
+
                 if (newState == FAILED || newState == FAILING || newState == ABORTED || newState == ABORTING) {
                     // don't close buffers for a failed query
                     // closed buffers signal to upstream tasks that everything finished cleanly
@@ -181,37 +211,13 @@ public class SqlTask
                     outputBuffer.destroy();
                 }
 
-                if (newState.isTerminating()) {
-                    // This section must be synchronized to lock out any threads that might be attempting to create a SqlTaskExecution
-                    synchronized (SqlTask.this) {
-                        // No SqlTaskExecution exists, termination is complete
-                        if (taskHolderReference.get().getTaskExecution() == null) {
-                            taskStateMachine.terminationComplete();
-                        }
+                // Successfully set the final task info, call the completion handler after releasing the lock
+                if (isDone) {
+                    try {
+                        onDone.accept(this);
                     }
-                }
-                else if (newState.isDone()) {
-                    // store final task info and cleanup when done
-                    while (true) {
-                        TaskHolder taskHolder = taskHolderReference.get();
-                        if (taskHolder.isFinished()) {
-                            // another concurrent worker already set the final state
-                            break;
-                        }
-
-                        if (taskHolderReference.compareAndSet(taskHolder, new TaskHolder(
-                                createTaskInfo(taskHolder),
-                                taskHolder.getIoStats(),
-                                taskHolder.getDynamicFilterDomains()))) {
-                            // Successfully set the final task info, call the completion handler
-                            try {
-                                onDone.accept(this);
-                            }
-                            catch (Exception e) {
-                                log.warn(e, "Error running task cleanup callback %s", SqlTask.this.taskId);
-                            }
-                            break;
-                        }
+                    catch (Exception e) {
+                        log.warn(e, "Error running task cleanup callback %s", SqlTask.this.taskId);
                     }
                 }
             }
@@ -443,6 +449,7 @@ public class SqlTask
             OutputBuffers outputBuffers,
             Map<DynamicFilterId, Domain> dynamicFilterDomains)
     {
+        boolean taskHolderLocked = false;
         try {
             // trace token must be set first to make sure failure injection for getTaskResults requests works as expected
             session.getTraceToken().ifPresent(traceToken::set);
@@ -452,37 +459,25 @@ public class SqlTask
             // a VALUES query).
             outputBuffer.setOutputBuffers(outputBuffers);
 
-            // assure the task execution is only created once
-            SqlTaskExecution taskExecution;
-            synchronized (this) {
-                // is task already complete?
-                TaskHolder taskHolder = taskHolderReference.get();
-                if (taskHolder.isFinished()) {
-                    return taskHolder.getFinalTaskInfo();
-                }
-                taskExecution = taskHolder.getTaskExecution();
-                if (taskExecution == null) {
-                    TaskState taskState = taskStateMachine.getState();
-                    // Don't create SqlTaskExecution once termination has started
-                    if (!taskState.isTerminatingOrDone()) {
-                        checkState(fragment.isPresent(), "fragment must be present");
-                        taskExecution = sqlTaskExecutionFactory.create(
-                                session,
-                                queryContext,
-                                taskStateMachine,
-                                outputBuffer,
-                                fragment.get(),
-                                this::notifyStatusChanged);
-                        taskHolderReference.compareAndSet(taskHolder, new TaskHolder(taskExecution));
-                        needsPlan.set(false);
-                        taskExecution.start();
-                    }
-                    else if (taskState.isTerminating()) {
-                        // mark termination completed if no SqlTaskExecution was created
-                        taskStateMachine.terminationComplete();
-                    }
-                }
+            // is task already complete?
+            TaskHolder taskHolder = taskHolderReference.get();
+            if (taskHolder.isFinished()) {
+                return taskHolder.getFinalTaskInfo();
             }
+
+            SqlTaskExecution taskExecution = taskHolder.getTaskExecution();
+            if (taskExecution == null) {
+                checkState(fragment.isPresent(), "fragment must be present");
+                // any exception thrown from execution creation should release the lock after
+                // failing the state machine to avoid duplicate creation attempts
+                taskHolderLock.lock();
+                taskHolderLocked = true;
+                taskExecution = tryCreateSqlTaskExecution(session, fragment.get());
+                // non-exceptional case can immediately release the lock
+                taskHolderLock.unlock();
+                taskHolderLocked = false;
+            }
+            // taskExecution can still be null if the task is terminating or done
             if (taskExecution != null) {
                 taskExecution.addSplitAssignments(splitAssignments);
                 taskExecution.getTaskContext().addDynamicFilter(dynamicFilterDomains);
@@ -495,8 +490,48 @@ public class SqlTask
         catch (RuntimeException e) {
             return failed(e);
         }
+        finally {
+            if (taskHolderLocked) {
+                taskHolderLock.unlock();
+            }
+        }
 
         return getTaskInfo();
+    }
+
+    @Nullable
+    private SqlTaskExecution tryCreateSqlTaskExecution(Session session, PlanFragment fragment)
+    {
+        checkState(taskHolderLock.isHeldByCurrentThread(), "must hold taskHolderLock");
+
+        // Recheck holder for task execution after acquiring the lock
+        TaskHolder taskHolder = taskHolderReference.get();
+        if (taskHolder.isFinished()) {
+            return null;
+        }
+        SqlTaskExecution execution = taskHolder.getTaskExecution();
+        if (execution != null) {
+            return execution;
+        }
+
+        // Don't create a new execution if the task is already done
+        if (taskStateMachine.getState().isTerminatingOrDone()) {
+            return null;
+        }
+
+        execution = sqlTaskExecutionFactory.create(
+                session,
+                queryContext,
+                taskStateMachine,
+                outputBuffer,
+                fragment,
+                this::notifyStatusChanged);
+        needsPlan.set(false);
+        execution.start();
+        // this must happen after taskExecution.start(), otherwise it could become visible to a
+        // concurrent update without being fully initialized
+        checkState(taskHolderReference.compareAndSet(taskHolder, new TaskHolder(execution)), "unsynchronized concurrent task holder update");
+        return execution;
     }
 
     public ListenableFuture<BufferResult> getTaskResults(PipelinedOutputBuffers.OutputBufferId bufferId, long startingSequenceId, DataSize maxSize)

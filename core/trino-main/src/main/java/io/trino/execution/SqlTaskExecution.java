@@ -169,7 +169,6 @@ public class SqlTaskExecution
             // don't register the task if it is already completed (most likely failed during planning above)
             if (taskStateMachine.getState().isTerminatingOrDone()) {
                 taskHandle = null;
-                driverFactories.forEach(DriverFactory::noMoreDrivers);
             }
             else {
                 taskHandle = createTaskHandle(taskStateMachine, taskContext, outputBuffer, driverFactories, taskExecutor, driverAndTaskTerminationTracker);
@@ -177,19 +176,23 @@ public class SqlTaskExecution
         }
     }
 
-    public void start()
+    // this must be synchronized to lock out listeners from checking task completion before initial task lifecycle drivers are scheduled
+    public synchronized void start()
     {
         try (SetThreadName ignored = new SetThreadName("Task-%s", getTaskId())) {
-            // Signal immediate termination complete if task termination has started
-            if (taskStateMachine.getState().isTerminating()) {
+            if (taskHandle == null || taskStateMachine.getState().isTerminatingOrDone()) {
+                // cleanup all driver runner factories since no drivers will be created
+                allDriverRunnerFactories.forEach(DriverSplitRunnerFactory::noMoreDriverRunner);
+                // signal termination completed
                 taskStateMachine.terminationComplete();
             }
-            else if (taskHandle != null) {
+            else {
+                // The scheduleDriversForTaskLifeCycle method calls enqueueDriverSplitRunner, which registers a callback with access to this object.
+                // The call back is accessed from another thread, so this code cannot be placed in the constructor. This must also happen before outputBuffer
+                // callbacks are registered to prevent a task completion check before task lifecycle splits are created
+                scheduleDriversForTaskLifeCycle();
                 // Output buffer state change listener callback must not run in the constructor to avoid leaking a reference to "this" across to another thread
                 outputBuffer.addStateChangeListener(new CheckTaskCompletionOnBufferFinish(SqlTaskExecution.this));
-                // The scheduleDriversForTaskLifeCycle method calls enqueueDriverSplitRunner, which registers a callback with access to this object.
-                // The call back is accessed from another thread, so this code cannot be placed in the constructor.
-                scheduleDriversForTaskLifeCycle();
             }
         }
     }
@@ -367,6 +370,7 @@ public class SqlTaskExecution
             }
         }
         enqueueDriverSplitRunner(true, runners);
+        // releasing the lock is safe after task lifecycle split runners are enqueued
         for (DriverSplitRunnerFactory driverRunnerFactory : driverRunnerFactoriesWithTaskLifeCycle) {
             driverRunnerFactory.noMoreDriverRunner();
             verify(driverRunnerFactory.isNoMoreDriverRunner());
