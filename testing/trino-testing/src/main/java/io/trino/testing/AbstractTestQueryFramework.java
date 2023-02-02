@@ -26,6 +26,7 @@ import io.trino.execution.QueryStats;
 import io.trino.execution.SqlTaskManager;
 import io.trino.execution.TaskId;
 import io.trino.execution.TaskInfo;
+import io.trino.execution.TaskState;
 import io.trino.execution.warnings.WarningCollector;
 import io.trino.memory.LocalMemoryManager;
 import io.trino.memory.MemoryPool;
@@ -222,8 +223,9 @@ public abstract class AbstractTestQueryFramework
                             }
                             catch (NoSuchElementException ignored) {
                             }
-                            if (!taskInfo.getTaskStatus().getState().isDone()) {
-                                fail("Task is expected to be in done state. TaskId: %s, QueryId: %s, Query: %s ".formatted(taskId, queryId, query));
+                            TaskState taskState = taskInfo.getTaskStatus().getState();
+                            if (!taskState.isDone()) {
+                                fail("Task is expected to be in done state, found: %s - TaskId: %s, QueryId: %s, Query: %s ".formatted(taskState, taskId, queryId, query));
                             }
                         }
                     }
