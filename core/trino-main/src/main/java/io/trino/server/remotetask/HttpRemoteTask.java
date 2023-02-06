@@ -187,7 +187,7 @@ public final class HttpRemoteTask
     private final PartitionedSplitCountTracker partitionedSplitCountTracker;
 
     private final AtomicBoolean started = new AtomicBoolean(false);
-    private final AtomicReference<Backoff> terminationDone = new AtomicReference<>();
+    private final AtomicBoolean terminated = new AtomicBoolean(false);
 
     private final int guaranteedSplitsPerRequest;
     private final long maxRequestSizeInBytes;
@@ -875,16 +875,19 @@ public final class HttpRemoteTask
     {
         TaskState taskInfoState = getTaskInfo().getTaskStatus().getState();
         if (taskInfoState.isDone()) {
-            // Do not initiate another round of cleanup requests if the final task info has been received
+            // Do not initiate another round of cleanup requests if the final task info has been received or the
+            // task is unreachable
             return;
         }
 
-        Backoff cleanupBackoff = new Backoff(maxErrorDuration);
-        // Only attempt a single termination with backoff handling
-        if (terminationDone.compareAndSet(null, cleanupBackoff)) {
-            Request request = remoteRequestSupplier.get();
-            doScheduleAsyncCleanupRequest(cleanupBackoff, request, action);
+        // Only allow a single final cleanup request once the task status sees a final state
+        TaskState taskStatusState = getTaskStatus().getState();
+        if (taskStatusState.isDone() && !terminated.compareAndSet(false, true)) {
+            return;
         }
+
+        Request request = remoteRequestSupplier.get();
+        doScheduleAsyncCleanupRequest(new Backoff(maxErrorDuration), request, action);
     }
 
     private Request buildDeleteTaskRequest(boolean abort)
@@ -917,14 +920,14 @@ public final class HttpRemoteTask
                     updateTaskInfo(result.getValue());
                 }
                 finally {
-                    // if cleanup operation has not been received successfully, must force immediately local cleanup
                     TaskState taskState = getTaskInfo().getTaskStatus().getState();
-                    if (!taskState.isTerminatingOrDone()) {
-                        fatalUnacknowledgedFailure(new TrinoException(REMOTE_TASK_ERROR, format("Unable to %s task at %s, last known state was: %s", action, request.getUri(), taskState)));
-                    }
-                    else {
-                        // Clear the current termination backoff
-                        terminationDone.compareAndSet(cleanupBackoff, null);
+                    if (!taskState.isDone()) {
+                        // if cleanup operation has not finished, allow more cleanup requests to be sent
+                        terminated.set(false);
+                        // if cleanup operation has not at least started task termination, mark the task failed
+                        if (!taskState.isTerminating()) {
+                            fatalUnacknowledgedFailure(new TrinoTransportException(REMOTE_TASK_ERROR, fromUri(request.getUri()), format("Unable to %s task at %s, last known state was: %s", action, request.getUri(), taskState)));
+                        }
                     }
                 }
             }
@@ -971,8 +974,8 @@ public final class HttpRemoteTask
     private synchronized void fatalUnacknowledgedFailure(Throwable cause)
     {
         try (SetThreadName ignored = new SetThreadName("HttpRemoteTask-%s", taskId)) {
-            // If TaskInfo has a final state already, then no additional work can be done
-            if (!getTaskStatus().getState().isDone()) {
+            TaskStatus taskStatus = getTaskStatus();
+            if (!taskStatus.getState().isDone()) {
                 // Update the taskInfo with the new taskStatus.
 
                 // Generally, we send a cleanup request to the worker, and update the TaskInfo on
@@ -982,22 +985,20 @@ public final class HttpRemoteTask
                 // we have to set the local query info directly so that we stop trying to fetch
                 // updated TaskInfo from the worker. This way, the task on the worker eventually
                 // expires due to lack of activity.
-                TaskStatus taskStatus = getTaskStatus();
                 List<ExecutionFailureInfo> failures = ImmutableList.<ExecutionFailureInfo>builderWithExpectedSize(taskStatus.getFailures().size() + 1)
                         .add(toFailure(cause))
                         .addAll(taskStatus.getFailures())
                         .build();
                 taskStatus = failWith(taskStatus, FAILED, failures);
-
-                // Send a final attempt to destroy the task unless the host is entirely unreachable
+                taskStatusFetcher.updateTaskStatus(taskStatus);
                 if (cause instanceof TrinoTransportException) {
                     // Since this TaskInfo is updated in the client the "complete" flag will not be set,
                     // indicating that the stats may not reflect the final stats on the worker.
-                    updateTaskInfo(getTaskInfo().withTaskStatus(taskStatus));
+                    updateTaskInfo(getTaskInfo().withTaskStatus(getTaskStatus()));
                 }
                 else {
-                    // Force the task status to failed, let the final TaskInfo come later
-                    taskStatusFetcher.updateTaskStatus(taskStatus);
+                    // Send a termination command to the task to await the final update
+                    scheduleAsyncCleanupRequest("cleanup", true);
                 }
             }
         }
