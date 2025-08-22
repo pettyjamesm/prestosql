@@ -23,25 +23,23 @@ import jdk.incubator.vector.VectorSpecies;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Optional;
-import java.util.logging.Logger;
 
 import static java.util.Objects.checkFromIndexSize;
 import static java.util.Objects.requireNonNull;
 
 final class EncoderUtil
 {
-    private static final Logger log = Logger.getLogger(EncoderUtil.class.getName());
     private static final VectorSpecies<Long> LONG_SPECIES = LongVector.SPECIES_PREFERRED;
     private static final boolean VECTORIZE_PACKING;
 
     static {
+        int hardwareBitSize = LONG_SPECIES.vectorBitSize();
+        boolean flagEnabled = Boolean.parseBoolean(System.getProperty("enable.vectorize", "true"));
+        System.out.println("LongVector Size: " + hardwareBitSize);
+        System.out.println("Flag Enabled: " + flagEnabled);
         // Only enable vectorized compress / expand loops on hardware with intrinsic support
         // for those operations
         // TODO: Is this check sufficient?
-        int hardwareBitSize = LONG_SPECIES.vectorBitSize();
-        boolean flagEnabled = Boolean.parseBoolean(System.getProperty("enable.vectorize", "true"));
-        log.info("LongVector Size: " + hardwareBitSize);
-        log.info("Flag Enabled: " + flagEnabled);
         VECTORIZE_PACKING = hardwareBitSize >= 256 && flagEnabled;
     }
 

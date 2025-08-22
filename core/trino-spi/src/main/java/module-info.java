@@ -18,7 +18,6 @@ module trino.spi {
     requires jakarta.annotation;
     requires transitive slice;
     requires jdk.incubator.vector;
-    requires java.logging;
 
     exports io.trino.spi;
     exports io.trino.spi.block;
