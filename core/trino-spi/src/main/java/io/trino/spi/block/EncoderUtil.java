@@ -16,13 +16,35 @@ package io.trino.spi.block;
 import io.airlift.slice.SliceInput;
 import io.airlift.slice.SliceOutput;
 import jakarta.annotation.Nullable;
+import jdk.incubator.vector.LongVector;
+import jdk.incubator.vector.VectorMask;
+import jdk.incubator.vector.VectorSpecies;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.Optional;
+import java.util.logging.Logger;
+
+import static java.util.Objects.checkFromIndexSize;
+import static java.util.Objects.requireNonNull;
 
 final class EncoderUtil
 {
+    private static final Logger log = Logger.getLogger(EncoderUtil.class.getName());
+    private static final VectorSpecies<Long> LONG_SPECIES = LongVector.SPECIES_PREFERRED;
+    private static final boolean VECTORIZE_PACKING;
+
+    static {
+        // Only enable vectorized compress / expand loops on hardware with intrinsic support
+        // for those operations
+        // TODO: Is this check sufficient?
+        int hardwareBitSize = LONG_SPECIES.vectorBitSize();
+        boolean flagEnabled = Boolean.parseBoolean(System.getProperty("enable.vectorize", "true"));
+        log.info("LongVector Size: " + hardwareBitSize);
+        log.info("Flag Enabled: " + flagEnabled);
+        VECTORIZE_PACKING = hardwareBitSize >= 256 && flagEnabled;
+    }
+
     private EncoderUtil() {}
 
     /**
@@ -165,5 +187,55 @@ final class EncoderUtil
         catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+    }
+
+    public static void compressLongsWithoutNulls(SliceOutput sliceOutput, long[] values, boolean[] isNull, int offset, int length)
+    {
+        if (VECTORIZE_PACKING) {
+            compressLongsWithoutNullsVectorized(sliceOutput, values, isNull, offset, length);
+        }
+        else {
+            compressLongsWithoutNullsScalar(sliceOutput, values, isNull, offset, length);
+        }
+    }
+
+    // @VisibleForTesting
+    static void compressLongsWithoutNullsVectorized(SliceOutput sliceOutput, long[] values, boolean[] isNull, int offset, int length)
+    {
+        requireNonNull(sliceOutput, "sliceOutput is null");
+        checkFromIndexSize(offset, length, values.length);
+        checkFromIndexSize(offset, length, isNull.length);
+        long[] compressed = new long[length];
+        int valuesIndex = 0;
+        int compressedIndex = 0;
+        for (; valuesIndex < LONG_SPECIES.loopBound(length); valuesIndex += LONG_SPECIES.length()) {
+            VectorMask<Long> mask = LONG_SPECIES.loadMask(isNull, valuesIndex + offset).not();
+            LongVector.fromArray(LONG_SPECIES, values, valuesIndex + offset)
+                    .compress(mask)
+                    .intoArray(compressed, compressedIndex);
+            compressedIndex += mask.trueCount();
+        }
+        for (; valuesIndex < length; valuesIndex++) {
+            compressed[compressedIndex] = values[valuesIndex + offset];
+            compressedIndex += isNull[valuesIndex + offset] ? 0 : 1;
+        }
+        sliceOutput.writeInt(compressedIndex);
+        sliceOutput.writeLongs(compressed, 0, compressedIndex);
+    }
+
+    // @VisibleForTesting
+    static void compressLongsWithoutNullsScalar(SliceOutput sliceOutput, long[] values, boolean[] isNull, int offset, int length)
+    {
+        requireNonNull(sliceOutput, "sliceOutput is null");
+        checkFromIndexSize(offset, length, values.length);
+        checkFromIndexSize(offset, length, isNull.length);
+        long[] compressed = new long[length];
+        int compressedIndex = 0;
+        for (int i = 0; i < length; i++) {
+            compressed[compressedIndex] = values[i + offset];
+            compressedIndex += isNull[i + offset] ? 0 : 1;
+        }
+        sliceOutput.writeInt(compressedIndex);
+        sliceOutput.writeLongs(compressed, 0, compressedIndex);
     }
 }
