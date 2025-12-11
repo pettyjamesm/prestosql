@@ -569,7 +569,15 @@
                         <!-- Ensure incubator Vector API is on the module path for javac -->
                         <compilerArgs combine.self="merge">
                             <arg>${extraJavaVectorArgs}</arg>
+                            <arg>-proc:full</arg>
                         </compilerArgs>
+                        <annotationProcessorPaths>
+                          <path>
+                            <groupId>org.openjdk.jmh</groupId>
+                            <artifactId>jmh-generator-annprocess</artifactId>
+                            <version>${dep.jmh.version}</version>
+                          </path>
+                        </annotationProcessorPaths>
                     </configuration>
                 </plugin>
                 <plugin>
