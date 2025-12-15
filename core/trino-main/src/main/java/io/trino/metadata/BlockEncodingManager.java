@@ -49,17 +49,17 @@ public final class BlockEncodingManager
     {
         // add the built-in BlockEncodings
         SimdSupport simdSupport = blockEncodingSimdSupport.getSimdSupport();
-        addBlockEncoding(new VariableWidthBlockEncoding());
-        addBlockEncoding(new ByteArrayBlockEncoding(simdSupport.compressByte(), simdSupport.expandByte()));
-        addBlockEncoding(new ShortArrayBlockEncoding(simdSupport.compressShort(), simdSupport.expandShort()));
-        addBlockEncoding(new IntArrayBlockEncoding(simdSupport.compressInt(), simdSupport.expandInt()));
-        addBlockEncoding(new LongArrayBlockEncoding(simdSupport.compressLong(), simdSupport.expandLong()));
-        addBlockEncoding(new Fixed12BlockEncoding());
-        addBlockEncoding(new Int128ArrayBlockEncoding());
+        addBlockEncoding(new VariableWidthBlockEncoding(simdSupport.packIsNullBits()));
+        addBlockEncoding(new ByteArrayBlockEncoding(simdSupport.packIsNullBits(), simdSupport.compressByte(), simdSupport.expandByte()));
+        addBlockEncoding(new ShortArrayBlockEncoding(simdSupport.packIsNullBits(), simdSupport.compressShort(), simdSupport.expandShort()));
+        addBlockEncoding(new IntArrayBlockEncoding(simdSupport.packIsNullBits(), simdSupport.compressInt(), simdSupport.expandInt()));
+        addBlockEncoding(new LongArrayBlockEncoding(simdSupport.packIsNullBits(), simdSupport.compressLong(), simdSupport.expandLong()));
+        addBlockEncoding(new Fixed12BlockEncoding(simdSupport.packIsNullBits()));
+        addBlockEncoding(new Int128ArrayBlockEncoding(simdSupport.packIsNullBits()));
         addBlockEncoding(new DictionaryBlockEncoding());
-        addBlockEncoding(new ArrayBlockEncoding());
-        addBlockEncoding(new MapBlockEncoding());
-        addBlockEncoding(new RowBlockEncoding());
+        addBlockEncoding(new ArrayBlockEncoding(simdSupport.packIsNullBits()));
+        addBlockEncoding(new MapBlockEncoding(simdSupport.packIsNullBits()));
+        addBlockEncoding(new RowBlockEncoding(simdSupport.packIsNullBits()));
         addBlockEncoding(new RunLengthBlockEncoding());
     }
 
