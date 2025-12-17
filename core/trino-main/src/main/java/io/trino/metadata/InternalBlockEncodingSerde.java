@@ -36,7 +36,7 @@ import static java.util.Objects.requireNonNull;
 public final class InternalBlockEncodingSerde
         implements BlockEncodingSerde
 {
-    public static final BlockEncodingSerde TESTING_BLOCK_ENCODING_SERDE = new InternalBlockEncodingSerde(new BlockEncodingManager(new BlockEncodingSimdSupport(true)), TESTING_TYPE_MANAGER);
+    public static final BlockEncodingSerde TESTING_BLOCK_ENCODING_SERDE = new InternalBlockEncodingSerde(new BlockEncodingManager(new BlockEncodingSimdSupport(BlockEncodingSimdSupport.SimdSupport.ALL)), TESTING_TYPE_MANAGER);
 
     private final Function<String, BlockEncoding> nameToEncoding; // for deserialization
     private final Function<Class<? extends Block>, BlockEncoding> blockToEncoding; // for serialization

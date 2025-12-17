@@ -26,6 +26,7 @@ import java.util.Set;
 
 import static io.trino.util.MachineInfo.readCpuFlags;
 import static java.util.Locale.ENGLISH;
+import static java.util.Objects.requireNonNull;
 
 /*
 We need to specifically detect AVX512F (for VPCOMPRESSD / VPCOMPRESSQ instruction support for int and long types) and
@@ -74,12 +75,12 @@ public final class BlockEncodingSimdSupport
 
     public BlockEncodingSimdSupport(boolean enableAutoDetectedSimdSupport)
     {
-        if (enableAutoDetectedSimdSupport) {
-            simdSupport = AUTO_DETECTED_SUPPORT;
-        }
-        else {
-            simdSupport = SimdSupport.NONE;
-        }
+        this(enableAutoDetectedSimdSupport ? AUTO_DETECTED_SUPPORT : SimdSupport.NONE);
+    }
+
+    public BlockEncodingSimdSupport(SimdSupport simdSupport)
+    {
+        this.simdSupport = requireNonNull(simdSupport, "simdSupport is null");
     }
 
     private static SimdSupport detectSimd()
@@ -89,12 +90,7 @@ public final class BlockEncodingSimdSupport
         int preferredBitWidth = VectorShape.preferredShape().vectorBitSize();
         Set<String> cpuFlags = readCpuFlags();
         SimdSupport detected = determineSimdSupport(arch, preferredBitWidth, cpuFlags);
-        if (log.isDebugEnabled()) {
-            log.info("Detected SIMD Support for architecture=%s, vectorBitWidth=%s, cpuFlags=%s: %s", arch, preferredBitWidth, cpuFlags, detected);
-        }
-        else {
-            log.info("Detected SIMD Support for architecture=%s, vectorBitWidth=%s: %s", arch, preferredBitWidth, detected);
-        }
+        log.info("Detected SIMD Support for architecture=%s, vectorBitWidth=%s, cpuFlags=%s: %s", arch, preferredBitWidth, cpuFlags, detected);
         return detected;
     }
 
